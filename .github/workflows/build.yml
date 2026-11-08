@@ -162,6 +162,9 @@ jobs:
             TAG="v$APP_VERSION"
           fi
           if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "FreedomPlus v$APP_VERSION" \
+              --notes-file release-notes.md
             gh release upload "$TAG" dist/* --clobber
           else
             gh release create "$TAG" dist/* \
