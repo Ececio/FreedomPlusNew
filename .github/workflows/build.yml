@@ -1,0 +1,170 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '构建完成后创建 GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+# 创建 Release 需要写权限
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      - name: Read app version
+        id: version
+        run: |
+          VERSION_NAME=$(sed -n 's/.*versionName "\(.*\)"/\1/p' app/build.gradle | head -n1)
+          VERSION_CODE=$(sed -n 's/.*versionCode \(.*\)/\1/p' app/build.gradle | head -n1)
+          if [ -z "$VERSION_NAME" ] || [ -z "$VERSION_CODE" ]; then
+            echo "无法从 app/build.gradle 读取版本号" >&2
+            exit 1
+          fi
+          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "FreedomPlus $VERSION_NAME ($VERSION_CODE)" >> "$GITHUB_STEP_SUMMARY"
+
+      # 若仓库配置了签名 Secrets，则构建签名后的 release 包；
+      # 否则退回 debug 包（debug 证书签名，可直接安装）。
+      # 需要的 Secrets：KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
+      - name: Configure signing
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > freedom-release.jks
+            {
+              echo "storeFile=freedom-release.jks"
+              echo "storePassword=$KEYSTORE_PASSWORD"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "keyPassword=$KEY_PASSWORD"
+            } > keystore.properties
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "variant=release" >> "$GITHUB_OUTPUT"
+            echo "- 签名：仓库 Secrets 中的固定 keystore" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "variant=debug" >> "$GITHUB_OUTPUT"
+            echo "- 签名：未配置 Secrets，使用 CI debug 证书" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build
+        run: |
+          chmod +x ./gradlew
+          if [ "${{ steps.signing.outputs.variant }}" = "release" ]; then
+            ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          else
+            ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Collect APK
+        id: apk
+        run: |
+          VERSION_NAME="${{ steps.version.outputs.name }}"
+          VARIANT="${{ steps.signing.outputs.variant }}"
+          APK=$(find "app/build/outputs/apk/$VARIANT" -name '*.apk' | head -n1)
+          if [ -z "$APK" ]; then
+            echo "未找到构建产物" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          APK_NAME="FreedomPlus-${VERSION_NAME}-${VARIANT}.apk"
+          cp "$APK" "dist/$APK_NAME"
+          (cd dist && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+          echo "name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK
+        run: |
+          APKSIGNER=$(find "${ANDROID_SDK_ROOT}/build-tools" -name apksigner | sort -V | tail -n1)
+          "$APKSIGNER" verify --print-certs "dist/${{ steps.apk.outputs.name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreedomPlus-${{ steps.version.outputs.name }}-${{ steps.signing.outputs.variant }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create release notes
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+        env:
+          APP_VERSION: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+        run: |
+          if [ "$SIGNED" = "true" ]; then
+            SIGNING_DESC="项目固定签名（Secrets 中的 keystore）"
+          else
+            SIGNING_DESC="CI debug 证书（未配置签名 Secrets）"
+          fi
+          cat > release-notes.md <<EOF
+          FreedomPlus v${APP_VERSION}（versionCode ${VERSION_CODE}）
+
+          - 构建产物：${APK_NAME}
+          - APK 签名：${SIGNING_DESC}
+          - 校验文件：${APK_NAME}.sha256
+          - 构建来源：GitHub Actions（${GITHUB_SHA}）
+
+          ## 安装
+
+          1. 需要已 root 并安装 LSPosed 的 Android 8.0+ 设备；
+          2. 安装 APK 后，在 LSPosed 中启用模块并勾选抖音作用域；
+          3. 本项目需要 64 位抖音客户端。
+
+          > Android 只允许相同签名的 APK 覆盖安装。如果设备上安装的是其他来源或 debug 证书签名的旧版本，需要先卸载再安装。
+          EOF
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ steps.version.outputs.name }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v$APP_VERSION"
+          fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "FreedomPlus v$APP_VERSION" \
+              --notes-file release-notes.md
+          fi
